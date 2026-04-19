@@ -1,0 +1,17 @@
+node_modules
+.git
+.gitignore
+Dockerfile
+.dockerignore
+npm-debug.log
+
+# Flutter / build files
+build
+dist
+.flutter-plugins
+.flutter-plugins-dependencies
+.dart_tool
+
+# OS files
+.DS_Store
+Thumbs.db

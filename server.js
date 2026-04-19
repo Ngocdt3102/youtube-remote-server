@@ -1,50 +1,210 @@
+const http = require('http');
 const WebSocket = require('ws');
 
-// Khởi tạo server chạy ở cổng 8080
-const port = 8080;
-const wss = new WebSocket.Server({ port: port });
+const port = process.env.PORT || 8080;
 
-console.log(`🚀 [Server] Trạm trung chuyển đang chạy tại cổng ${port}...`);
-console.log(`👉 Đang chờ Extension và App Flutter kết nối...`);
+// HTTP server
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end("🚀 WebSocket server is running");
+});
 
-wss.on('connection', function connection(ws, req) {
-    // Lấy IP của thiết bị kết nối để dễ quản lý
-    const ip = req.socket.remoteAddress;
-    console.log(`🟢 [Kết nối] Thiết bị mới từ: ${ip}`);
+// WebSocket attach vào HTTP
+const wss = new WebSocket.Server({ server });
 
-    ws.on('message', function incoming(message) {
-        // Chuyển dữ liệu từ Buffer sang String
+// Lưu rooms
+const rooms = {};
+
+server.listen(port, () => {
+    console.log(`✅ Server running on port ${port}`);
+});
+
+// ==========================
+// 🧠 UTILS
+// ==========================
+
+function generateRoomCode() {
+    let code;
+    do {
+        code = Math.floor(1000 + Math.random() * 9000).toString();
+    } while (rooms[code]);
+    return code;
+}
+
+function heartbeat() {
+    this.isAlive = true;
+}
+
+setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+// ==========================
+// 🔗 CONNECTION
+// ==========================
+
+wss.on('connection', (ws) => {
+    console.log("🟢 Client connected");
+
+    ws.isAlive = true;
+    ws.on('pong', heartbeat);
+    ws.roomCode = null;
+
+    ws.on('message', (message) => {
+        let data;
         const rawData = message.toString();
-        
-        // Log để bạn dễ debug trên terminal của máy tính
+
         try {
-            // Kiểm tra xem dữ liệu nhận được là JSON (Trạng thái) hay String (Lệnh)
-            const parsed = JSON.parse(rawData);
-            if (parsed.type === 'YOUTUBE_STATE') {
-                console.log(`📊 [State] Đang cập nhật Volume: ${parsed.volume}% | Ads: ${parsed.isAdShowing}`);
-            }
-        } catch (e) {
-            // Nếu không phải JSON thì là lệnh điều khiển bình thường
-            console.log(`📩 [Lệnh] Nhận được: ${rawData}`);
+            data = JSON.parse(rawData);
+        } catch {
+            data = { type: rawData };
         }
 
-        // BROADCAST: Gửi dữ liệu này tới TẤT CẢ các thiết bị đang kết nối
-        // Chúng ta gửi cho cả chính thiết bị gửi để đảm bảo tính đồng bộ (optional)
-        // Hoặc giữ nguyên client !== ws nếu bạn muốn tiết kiệm băng thông
-        wss.clients.forEach(function each(client) {
-            if (client.readyState === WebSocket.OPEN) {
-                // Ở phiên bản này, mình bỏ điều kiện 'client !== ws' 
-                // để App Flutter cũng có thể nhận xác nhận ngay lập tức nếu cần
-                client.send(rawData);
+        // ==========================
+        // 🏠 CREATE ROOM (ĐÃ NÂNG CẤP AUTO-RECONNECT)
+        // ==========================
+        if (data.type === 'CREATE_ROOM') {
+            if (ws.roomCode) {
+                ws.send(JSON.stringify({ type: 'ALREADY_IN_ROOM' }));
+                return;
             }
-        });
+
+            let roomCode = data.code; // Lấy mã do Extension gửi lên (nếu có)
+
+            // Nếu không có mã, hoặc mã bị trùng lặp phức tạp -> Tạo mới
+            if (!roomCode) {
+                roomCode = generateRoomCode();
+                rooms[roomCode] = [ws];
+                console.log(`🏠 Room created randomly: ${roomCode}`);
+            } else {
+                // Nếu Extension gửi mã cũ (Khi F5 Reload trang)
+                if (!rooms[roomCode]) {
+                    // Phòng cũ đã bị xóa, tạo lại phòng với đúng mã đó
+                    rooms[roomCode] = [ws];
+                    console.log(`🏠 Room recreated from session: ${roomCode}`);
+                } else {
+                    // Xóa các kết nối chết (Ghost) trước khi thêm vào
+                    rooms[roomCode] = rooms[roomCode].filter(c => c.readyState === WebSocket.OPEN);
+                    
+                    rooms[roomCode].push(ws);
+                    console.log(`🏠 Extension rejoined room: ${roomCode}`);
+                }
+            }
+
+            ws.roomCode = roomCode;
+
+            // Báo cho Extension biết mã phòng
+            ws.send(JSON.stringify({
+                type: 'ROOM_CREATED',
+                code: roomCode
+            }));
+
+            // 🔥 QUAN TRỌNG: Nếu điện thoại vẫn đang đợi trong phòng này
+            // Lập tức báo cho cả 2 thiết bị nối lại với nhau!
+            if (rooms[roomCode].length >= 2) {
+                rooms[roomCode].forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: 'PARTNER_CONNECTED' }));
+                    }
+                });
+            }
+
+            return;
+        }
+
+        // ==========================
+        // 📱 JOIN ROOM (TỪ ĐIỆN THOẠI)
+        // ==========================
+        if (data.type === 'JOIN_ROOM') {
+            if (ws.roomCode) {
+                ws.send(JSON.stringify({ type: 'ALREADY_IN_ROOM' }));
+                return;
+            }
+
+            const code = data.code;
+
+            if (!rooms[code]) {
+                ws.send(JSON.stringify({
+                    type: 'JOIN_ERROR',
+                    message: 'Mã phòng không tồn tại'
+                }));
+                return;
+            }
+
+            // 🛠 Lọc bỏ kết nối chết trước khi kiểm tra số lượng
+            rooms[code] = rooms[code].filter(c => c.readyState === WebSocket.OPEN);
+
+            if (rooms[code].length >= 2) {
+                ws.send(JSON.stringify({ type: 'ROOM_FULL' }));
+                return;
+            }
+
+            // 👉 Điện thoại tham gia phòng
+            rooms[code].push(ws);
+            ws.roomCode = code;
+
+            // 👉 Xác nhận cho điện thoại
+            ws.send(JSON.stringify({
+                type: 'JOIN_SUCCESS',
+                code: code
+            }));
+
+            console.log(`📱 Mobile joined room: ${code}`);
+
+            // 👉 Báo cho Chrome Extension biết điện thoại đã vào
+            rooms[code].forEach(client => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: 'PARTNER_CONNECTED' }));
+                }
+            });
+
+            return;
+        }
+
+        // ==========================
+        // 🔁 RELAY MESSAGE (CHUYỂN TIẾP LỆNH)
+        // ==========================
+        if (ws.roomCode && rooms[ws.roomCode]) {
+            rooms[ws.roomCode].forEach(client => {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(rawData);
+                }
+            });
+        }
     });
 
+    // ==========================
+    // ❌ DISCONNECT
+    // ==========================
     ws.on('close', () => {
-        console.log("🔴 [Ngắt kết nối] Một thiết bị đã rời khỏi mạng.");
+        const room = ws.roomCode;
+
+        if (room && rooms[room]) {
+            rooms[room] = rooms[room].filter(c => c !== ws);
+            console.log(`🔴 Client left room ${room}`);
+
+            // 👉 Báo cho thiết bị còn lại biết partner đã mất kết nối
+            rooms[room].forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: 'PARTNER_DISCONNECTED' }));
+                }
+            });
+
+            // Chỉ xóa phòng nếu TRỐNG HOÀN TOÀN
+            if (rooms[room].length === 0) {
+                delete rooms[room];
+                console.log(`🗑️ Room deleted: ${room}`);
+            }
+        }
+
+        ws.roomCode = null;
     });
 
-    ws.on('error', (error) => {
-        console.error("⚠️ [Lỗi Server]:", error.message);
+    ws.on('error', (err) => {
+        console.error("⚠️ Error:", err.message);
     });
 });
